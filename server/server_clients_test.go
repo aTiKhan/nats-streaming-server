@@ -322,6 +322,12 @@ func TestClientsWithDupCID(t *testing.T) {
 	}
 	defer nc.Close()
 
+	// Check if we are connected to a no responder server.
+	var noResponders bool
+	if _, err := nc.Request("no.responders", []byte("check"), 10*time.Millisecond); err == nats.ErrNoResponders {
+		noResponders = true
+	}
+
 	dupCIDName := "dupCID"
 
 	sc, err := stan.Connect(clusterName, dupCIDName, stan.NatsConn(nc))
@@ -341,11 +347,16 @@ func TestClientsWithDupCID(t *testing.T) {
 	dupTimeoutMin := time.Duration(float64(s.dupCIDTimeout) * 0.9)
 	dupTimeoutMax := time.Duration(float64(s.dupCIDTimeout) * 1.1)
 
+	if noResponders {
+		dupTimeoutMin = 0
+		dupTimeoutMax = 50 * time.Millisecond
+	}
+
 	wg.Add(1)
 
 	connect := func(cid string, shouldFail bool) (stan.Conn, time.Duration, error) {
 		start := time.Now()
-		c, err := stan.Connect(clusterName, cid, stan.ConnectWait(3*s.dupCIDTimeout))
+		c, err := stan.Connect(clusterName, cid, stan.NatsURL(nats.DefaultURL), stan.ConnectWait(3*s.dupCIDTimeout))
 		duration := time.Since(start)
 		if shouldFail {
 			if c != nil {
@@ -389,7 +400,7 @@ func TestClientsWithDupCID(t *testing.T) {
 			}
 			// These should fail "immediately", so consider it a failure if
 			// it is close to the dupCIDTimeout
-			if duration >= dupTimeoutMin {
+			if duration >= s.dupCIDTimeout {
 				errors <- fmt.Errorf("Connect took too long to fail: %v", duration)
 			}
 		}
@@ -401,7 +412,7 @@ func TestClientsWithDupCID(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 	defer newConn.Close()
-	if duration >= dupTimeoutMin {
+	if duration >= dupTimeoutMax {
 		t.Fatalf("Connect expected to be fast, took %v", duration)
 	}
 

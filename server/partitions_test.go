@@ -159,7 +159,7 @@ func TestPartitionsMaxPayload(t *testing.T) {
 	defer ns.Shutdown()
 
 	opts1 := GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel("foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo", &stores.ChannelLimits{})
 	failSrv, err := RunServerWithOpts(opts1, nil)
@@ -179,7 +179,7 @@ func TestPartitionsMaxPayload(t *testing.T) {
 	defer ns.Shutdown()
 
 	opts1 = GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel("foo", &stores.ChannelLimits{})
 	s1 := runServerWithOpts(t, opts1, nil)
@@ -216,7 +216,7 @@ func TestPartitionsMaxPayload(t *testing.T) {
 	}
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	for i := 0; i < total-1; i++ {
 		channelName := fmt.Sprintf("channel.number.%d", (i + 1))
@@ -301,14 +301,14 @@ func TestPartitionsWithClusterOfServers(t *testing.T) {
 	barSubj := "bar"
 
 	opts1 := GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel(fooSubj, &stores.ChannelLimits{})
 	s1 := runServerWithOpts(t, opts1, nil)
 	defer s1.Shutdown()
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	opts2.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
 	s2 := runServerWithOpts(t, opts2, nil)
@@ -385,7 +385,7 @@ func TestPartitionsDuplicatedOnTwoServers(t *testing.T) {
 	barSubj := "bar"
 
 	opts1 := GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel(fooSubj, &stores.ChannelLimits{})
 	opts1.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
@@ -393,7 +393,7 @@ func TestPartitionsDuplicatedOnTwoServers(t *testing.T) {
 	defer s1.Shutdown()
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	opts2.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
 	// Expecting this to fail
@@ -417,7 +417,7 @@ func TestPartitionsConflictDueToWildcards(t *testing.T) {
 	defer s1.Shutdown()
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	opts2.StoreLimits.AddPerChannel("foo.bar", &stores.ChannelLimits{})
 	// Expecting this to fail
@@ -446,6 +446,7 @@ func TestPartitionsSendListAfterRouteEstablished(t *testing.T) {
 
 	ncOpts1 := natsdTest.DefaultTestOptions
 	ncOpts1.Host = "127.0.0.1"
+	ncOpts1.Cluster.Name = "abc"
 	ncOpts1.Cluster.Host = "127.0.0.1"
 	ncOpts1.Cluster.Port = 6222
 	ncOpts1.Routes = natsd.RoutesFromStr("nats://127.0.0.1:6223")
@@ -506,6 +507,7 @@ func TestPartitionsSendListAfterRouteEstablished(t *testing.T) {
 	ncOpts2 := natsdTest.DefaultTestOptions
 	ncOpts2.Host = "127.0.0.1"
 	ncOpts2.Port = 4223
+	ncOpts2.Cluster.Name = "abc"
 	ncOpts2.Cluster.Host = "127.0.0.1"
 	ncOpts2.Cluster.Port = 6223
 	ns2 := natsdTest.RunServer(&ncOpts2)
@@ -932,7 +934,7 @@ func TestPartitionsAndFT(t *testing.T) {
 	opts := getTestFTDefaultOptions()
 	opts.Partitioning = true
 	opts.AddPerChannel("foo", &stores.ChannelLimits{})
-	opts.NATSServerURL = "nats://localhost:4222"
+	opts.NATSServerURL = "nats://127.0.0.1:4222"
 
 	ft1 := runServerWithOpts(t, opts, nil)
 	defer ft1.Shutdown()
@@ -969,14 +971,14 @@ func TestPartitionsClientPings(t *testing.T) {
 	barSubj := "bar"
 
 	opts1 := GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel(fooSubj, &stores.ChannelLimits{})
 	s1 := runServerWithOpts(t, opts1, nil)
 	defer s1.Shutdown()
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	opts2.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
 	s2 := runServerWithOpts(t, opts2, nil)
@@ -1026,4 +1028,37 @@ func TestPartitionsCleanInvalidConns(t *testing.T) {
 	if mlen > maxKnownInvalidConns {
 		t.Fatalf("Should not be more than %v, got %v", maxKnownInvalidConns, mlen)
 	}
+}
+
+func TestPartitionsDurableReplaced(t *testing.T) {
+	setPartitionsVarsForTest()
+	defer resetDefaultPartitionsVars()
+
+	clientCheckTimeout = 150 * time.Millisecond
+	defer func() { clientCheckTimeout = defaultClientCheckTimeout }()
+
+	// For this test, create a single NATS server to which both servers connect to.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	fooSubj := "foo"
+	barSubj := "bar"
+
+	opts1 := GetDefaultOptions()
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
+	opts1.Partitioning = true
+	opts1.ReplaceDurable = true
+	opts1.StoreLimits.AddPerChannel(fooSubj, &stores.ChannelLimits{})
+	s1 := runServerWithOpts(t, opts1, nil)
+	defer s1.Shutdown()
+
+	opts2 := GetDefaultOptions()
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
+	opts2.Partitioning = true
+	opts2.ReplaceDurable = true
+	opts2.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
+	s2 := runServerWithOpts(t, opts2, nil)
+	defer s2.Shutdown()
+
+	testDurableReplaced(t, s1)
 }
