@@ -1,7 +1,7 @@
 #!/bin/bash -e
 # Run from directory above via ./scripts/cov.sh
 
-export GO111MODULE="off"
+export GO111MODULE="on"
 
 go get github.com/mattn/goveralls
 go get github.com/wadey/gocovmerge
@@ -23,10 +23,9 @@ go test -v -failfast -covermode=atomic -coverprofile=./cov/util.out ./util
 gocovmerge ./cov/*.out > acc.out
 rm -rf ./cov
 
-# If we have an arg, assume travis run and push to coveralls. Otherwise launch browser results
-if [[ -n $1 ]]; then
-    $HOME/gopath/bin/goveralls -coverprofile=acc.out
-    rm -rf ./acc.out
-else
+# Without argument, launch browser results. We are going to push to coveralls only
+# from Travis.yml and after success of the build (and result of pushing will not affect
+# build result).
+if [[ $1 == "" ]]; then
     go tool cover -html=acc.out
 fi

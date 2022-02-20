@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -67,8 +68,8 @@ func runMonitorServer(t *testing.T, sOpts *Options) *StanServer {
 	return runServerWithOpts(t, sOpts, &nOpts)
 }
 
-func getBodyEx(t *testing.T, client *http.Client, scheme, endpoint string, expectedStatus int, expectedContentType string) (*http.Response, []byte) {
-	url := fmt.Sprintf("%s://%s:%d%s", scheme, monitorHost, monitorPort, endpoint)
+func getBodyEx(t *testing.T, client *http.Client, scheme, endpoint string, mp, expectedStatus int, expectedContentType string) (*http.Response, []byte) {
+	url := fmt.Sprintf("%s://%s:%d%s", scheme, monitorHost, mp, endpoint)
 	resp, err := client.Get(url)
 	if err != nil {
 		stackFatalf(t, "Expected no error: Got %v\n", err)
@@ -89,7 +90,7 @@ func getBodyEx(t *testing.T, client *http.Client, scheme, endpoint string, expec
 }
 
 func getBody(t *testing.T, endpoint, expectedContentType string) (*http.Response, []byte) {
-	return getBodyEx(t, http.DefaultClient, "http", endpoint, http.StatusOK, expectedContentType)
+	return getBodyEx(t, http.DefaultClient, "http", endpoint, monitorPort, http.StatusOK, expectedContentType)
 }
 
 func monitorExpectStatusEx(t *testing.T, client *http.Client, scheme, endpoint string, expectedStatus int) {
@@ -164,7 +165,7 @@ func TestMonitorStartOwnHTTPSServer(t *testing.T) {
 	transport := &http.Transport{TLSClientConfig: tlsConfig}
 	httpClient := &http.Client{Transport: transport}
 
-	r, _ := getBodyEx(t, httpClient, "https", RootPath, http.StatusOK, expectedText)
+	r, _ := getBodyEx(t, httpClient, "https", RootPath, monitorPort, http.StatusOK, expectedText)
 	r.Body.Close()
 }
 
@@ -413,7 +414,7 @@ func TestMonitorIsFTActiveFTServer(t *testing.T) {
 			standby := runServerWithOpts(t, opts, sNOpts)
 			defer standby.Shutdown()
 
-			resp, _ := getBodyEx(t, http.DefaultClient, "http", IsFTActivePath, test.expectedStatus, "")
+			resp, _ := getBodyEx(t, http.DefaultClient, "http", IsFTActivePath, monitorPort, test.expectedStatus, "")
 			defer resp.Body.Close()
 		})
 	}
@@ -1447,4 +1448,68 @@ func TestMonitorInOutMsgs(t *testing.T) {
 	if sz.OutMsgs != 15 || sz.OutBytes == 0 {
 		t.Fatalf("Expected 15 outbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
 	}
+}
+
+func TestMonitorNoPanicOnServerRestart(t *testing.T) {
+	resetPreviousHTTPConnections()
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	opts := getTestDefaultOptsForPersistentStore()
+
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	opts.NATSServerURL = "nats://127.0.0.1:4222"
+	s := runMonitorServer(t, opts)
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	for i := 0; i < 100; i++ {
+		if _, err := sc.Subscribe(fmt.Sprintf("foo.%d", i+1),
+			func(_ *stan.Msg) {}, stan.DurableName("dur")); err != nil {
+			t.Fatalf("Error on subscribe: %v", err)
+		}
+	}
+
+	endpoints := []string{
+		"channelsz?subs=1",
+		"serverz",
+		"storez",
+		"clientsz",
+		"isFTActive",
+	}
+	for _, e := range endpoints {
+		s.Shutdown()
+
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		done := make(chan struct{})
+		go func() {
+			defer wg.Done()
+			url := fmt.Sprintf("http://%s:%d/streaming/", monitorHost, monitorPort)
+			for {
+				resp, err := http.DefaultClient.Get(url + e)
+				if err != nil {
+					continue
+				}
+				ioutil.ReadAll(resp.Body)
+				resp.Body.Close()
+				select {
+				case <-done:
+					return
+				default:
+				}
+			}
+		}()
+
+		s = runMonitorServer(t, opts)
+		defer s.Shutdown()
+
+		time.Sleep(100 * time.Millisecond)
+		close(done)
+		wg.Wait()
+	}
+	sc.Close()
 }

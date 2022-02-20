@@ -1,4 +1,4 @@
-// Copyright 2017-2021 The NATS Authors
+// Copyright 2017-2022 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,6 +21,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -8184,5 +8185,757 @@ func TestClusteringDurableReplaced(t *testing.T) {
 	c.ss.RUnlock()
 	if lenDur != 1 {
 		t.Fatalf("Expected 1 durable, got %v", lenDur)
+	}
+}
+
+func TestClusteringRaceCausesFollowerToRedeliverMsgs(t *testing.T) {
+	testRaceLeaderTransfer = true
+	defer func() { testRaceLeaderTransfer = false }()
+
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1sOpts.ReplaceDurable = true
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	// Wait for it to bootstrap
+	getLeader(t, 10*time.Second, s1)
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2sOpts.ReplaceDurable = true
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	// Configure third server.
+	s3sOpts := getTestDefaultOptsForClustering("c", false)
+	s3sOpts.ReplaceDurable = true
+	s3 := runServerWithOpts(t, s3sOpts, nil)
+	defer s3.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	ch := make(chan bool, 10)
+	errCh := make(chan error, 1)
+	prev := uint32(0)
+	if _, err := sc.Subscribe("foo",
+		func(m *stan.Msg) {
+			if !m.Redelivered {
+				ch <- true
+			} else {
+				if m.RedeliveryCount != prev+1 {
+					select {
+					case errCh <- fmt.Errorf("Received duplicate redelivered msg: %+v", m):
+					default:
+					}
+				}
+				prev = m.RedeliveryCount
+			}
+		},
+		stan.AckWait(ackWaitInMs(500)),
+		stan.DeliverAllAvailable(),
+		stan.DurableName("dur"),
+		stan.SetManualAckMode()); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	if err := sc.Publish("foo", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+
+	// Wait for message to be delivered
+	if err := WaitTime(ch, time.Second); err != nil {
+		t.Fatalf("Did not get message: %v", err)
+	}
+
+	// Stop the leader
+	s1.Shutdown()
+
+	// Wait for new leader
+	leader := getLeader(t, 10*time.Second, s2, s3)
+
+	// Stepdown
+	if err := leader.raft.LeadershipTransfer().Error(); err != nil {
+		t.Fatalf("Error stepping down: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case <-time.After(4 * time.Second):
+		// ok
+	}
+}
+
+func TestClusteringSnapshotQSubLastSent(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1sOpts.ReplaceDurable = true
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	// Wait for it to bootstrap
+	getLeader(t, 10*time.Second, s1)
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2sOpts.ReplaceDurable = true
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	// Configure third server.
+	s3sOpts := getTestDefaultOptsForClustering("c", false)
+	s3sOpts.ReplaceDurable = true
+	s3 := runServerWithOpts(t, s3sOpts, nil)
+	defer s3.Shutdown()
+
+	sc1 := NewDefaultConnection(t)
+	defer sc1.Close()
+
+	ch := make(chan bool, 1)
+	total := uint64(100)
+	sc1.QueueSubscribe("foo", "queue", func(m *stan.Msg) {
+		if m.Sequence == total {
+			select {
+			case ch <- true:
+			default:
+			}
+		}
+	})
+
+	nc2 := newNatsConnection(t)
+	defer nc2.Close()
+	sc2, err := stan.Connect(clusterName, clientName+"2",
+		stan.ConnectWait(250*time.Millisecond),
+		stan.NatsConn(nc2))
+	if err != nil {
+		t.Fatalf("Error connecting: %v", err)
+	}
+
+	sc2.QueueSubscribe("foo", "queue", func(m *stan.Msg) {}, stan.MaxInflight(1))
+	nc2.Close()
+
+	for i := 0; i < int(total); i++ {
+		sc1.Publish("foo", []byte("msg"))
+	}
+	if err := WaitTime(ch, 2*time.Second); err != nil {
+		t.Fatalf("Did not receive all messages: %v", err)
+	}
+	sc1.Close()
+
+	// Make sure this is processed in the servers
+	servers := []*StanServer{s1, s2, s3}
+	for _, s := range servers {
+		waitForNumClients(t, s, 1)
+	}
+	for _, s := range servers {
+		if err := s.raft.Snapshot().Error(); err != nil {
+			t.Fatalf("Error during snapshot: %v", err)
+		}
+	}
+	for _, s := range servers {
+		s.Shutdown()
+	}
+
+	// Restart b and c
+	s2 = runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	s3 = runServerWithOpts(t, s3sOpts, nil)
+	defer s3.Shutdown()
+
+	getLeader(t, 10*time.Second, s2, s3)
+
+	sc1 = NewDefaultConnection(t)
+	defer sc1.Close()
+
+	errCh := make(chan error, 1)
+	sc1.QueueSubscribe("foo", "queue", func(m *stan.Msg) {
+		// We should not be receiving anything.
+		select {
+		case errCh <- fmt.Errorf("Received message: %+v", m):
+			m.Sub.Unsubscribe()
+		default:
+		}
+	})
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case <-time.After(250 * time.Millisecond):
+		// OK
+	}
+}
+
+func TestClusteringMonitorQueueLastSentAndPendingAfterLeavingGroup(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		hbtimeout bool
+	}{
+		{"connection close", false},
+		{"hb timeout", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetPreviousHTTPConnections()
+			cleanupDatastore(t)
+			defer cleanupDatastore(t)
+			cleanupRaftLog(t)
+			defer cleanupRaftLog(t)
+
+			// For this test, use a central NATS server.
+			ns := natsdTest.RunDefaultServer()
+			defer ns.Shutdown()
+
+			// Configure first server
+			s1sOpts := getTestDefaultOptsForClustering("a", true)
+			s1sOpts.ClientHBInterval = 100 * time.Millisecond
+			s1sOpts.ClientHBTimeout = 100 * time.Millisecond
+			s1sOpts.ClientHBFailCount = 5
+			s1nOpts := defaultMonitorOptions
+			s1 := runServerWithOpts(t, s1sOpts, &s1nOpts)
+			defer s1.Shutdown()
+
+			// Configure second server.
+			s2sOpts := getTestDefaultOptsForClustering("b", false)
+			s2sOpts.ClientHBInterval = 100 * time.Millisecond
+			s2sOpts.ClientHBTimeout = 100 * time.Millisecond
+			s2sOpts.ClientHBFailCount = 5
+			s2nOpts := defaultMonitorOptions
+			s2nOpts.HTTPPort = monitorPort + 1
+			s2 := runServerWithOpts(t, s2sOpts, &s2nOpts)
+			defer s2.Shutdown()
+
+			// Configure third server.
+			s3sOpts := getTestDefaultOptsForClustering("c", false)
+			s3sOpts.ClientHBInterval = 100 * time.Millisecond
+			s3sOpts.ClientHBTimeout = 100 * time.Millisecond
+			s3sOpts.ClientHBFailCount = 5
+			s3nOpts := defaultMonitorOptions
+			s3nOpts.HTTPPort = monitorPort + 2
+			s3 := runServerWithOpts(t, s3sOpts, &s3nOpts)
+			defer s3.Shutdown()
+
+			getLeader(t, 10*time.Second, s1, s2, s3)
+
+			nc, err := nats.Connect(nats.DefaultURL)
+			if err != nil {
+				t.Fatalf("Unexpected error on connect: %v", err)
+			}
+			defer nc.Close()
+			sc, err := stan.Connect(clusterName, "instance1", stan.NatsConn(nc))
+			if err != nil {
+				t.Fatalf("Expected to connect correctly, got err %v", err)
+			}
+			defer sc.Close()
+
+			ch := make(chan bool, 1)
+			count := 0
+			if _, err := sc.QueueSubscribe("foo", "bar", func(m *stan.Msg) {
+				count++
+				if count == 3 {
+					ch <- true
+				}
+			}, stan.DurableName("dur"), stan.DeliverAllAvailable()); err != nil {
+				t.Fatalf("Error on subscribe: %v", err)
+			}
+
+			for i := 0; i < 3; i++ {
+				sc.Publish("foo", []byte("msg"))
+			}
+
+			if err := Wait(ch); err != nil {
+				t.Fatalf("Did not get all messages: %v", err)
+			}
+
+			checkMonitor := func() {
+				t.Helper()
+				waitFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+					for _, port := range []int{monitorPort, monitorPort + 1, monitorPort + 2} {
+						resp, body := getBodyEx(t, http.DefaultClient, "http", ChannelsPath+"?channel=foo&subs=1", port, http.StatusOK, expectedJSON)
+						defer resp.Body.Close()
+
+						cz := Channelz{}
+						if err := json.Unmarshal(body, &cz); err != nil {
+							return fmt.Errorf("Got an error unmarshalling the body: %v", err)
+						}
+						resp.Body.Close()
+
+						sub := cz.Subscriptions[0]
+						if sub.LastSent != 3 {
+							return fmt.Errorf("Unexpected last_sent: %v", sub.LastSent)
+						}
+						if sub.PendingCount != 0 {
+							return fmt.Errorf("Unexpected pending_count: %v", sub.PendingCount)
+						}
+					}
+					return nil
+				})
+			}
+
+			// Check that all see last_sent == 3 and pending_count == 0
+			checkMonitor()
+
+			// Start a new connection and create the same queue durable
+			sc2 := NewDefaultConnection(t)
+			defer sc2.Close()
+			if _, err := sc2.QueueSubscribe("foo", "bar", func(m *stan.Msg) {},
+				stan.DurableName("dur"), stan.DeliverAllAvailable()); err != nil {
+				t.Fatalf("Error on subscribe: %v", err)
+			}
+
+			// Now either close the STAN connection or the underlying NATS connection
+			// to simulate loss of HB and for the server to close the connection.
+			if test.hbtimeout {
+				nc.Close()
+			} else {
+				sc.Close()
+			}
+
+			// Wait for the server to close the old client
+			waitForNumClients(t, s1, 1)
+			waitForNumClients(t, s2, 1)
+			waitForNumClients(t, s3, 1)
+
+			// Now make sure that all servers reflect that the sole queue member's
+			// last_sent is set to 3 and pending_count is 0.
+			checkMonitor()
+		})
+	}
+}
+
+func TestClusteringQueueRedelivery(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	getLeader(t, 10*time.Second, s1, s2)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	redelivered := int32(0)
+	if _, err := sc.QueueSubscribe("foo", "bar", func(m *stan.Msg) {
+		if m.Redelivered {
+			atomic.AddInt32(&redelivered, 1)
+		}
+	}, stan.SetManualAckMode(), stan.AckWait(ackWaitInMs(100))); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	if err := sc.Publish("foo", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+
+	// Verify that it gets redelivered
+	waitForAcks(t, s1, clientName, 1, 1)
+	// Same on other server
+	waitForAcks(t, s2, clientName, 1, 1)
+
+	// After few redeliveries, start a second member.
+	waitFor(t, time.Second, 100*time.Millisecond, func() error {
+		if n := atomic.LoadInt32(&redelivered); n < 2 {
+			return fmt.Errorf("Redelivery count is still %v", n)
+		}
+		return nil
+	})
+
+	// Start a second queue member, it should get the message and
+	// will ack it (auto-ack)
+	ok := make(chan bool, 1)
+	if _, err := sc.QueueSubscribe("foo", "bar", func(m *stan.Msg) {
+		if m.Redelivered {
+			ok <- true
+		}
+	}); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	select {
+	case <-ok:
+	case <-time.After(time.Second):
+		t.Fatalf("Message was not redelivered to second queue member")
+	}
+
+	// Number of acks for sub1 and sub2 should be down to 0.
+	waitForAcks(t, s1, clientName, 1, 0)
+	waitForAcks(t, s1, clientName, 2, 0)
+	// Same on s2.
+	waitForAcks(t, s2, clientName, 1, 0)
+	waitForAcks(t, s2, clientName, 2, 0)
+}
+
+func TestClusteringQueueRedeliveryPendingAndStalled(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	servers := []*StanServer{s1, s2}
+	getLeader(t, 10*time.Second, servers...)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	ch := make(chan bool, 1)
+	if _, err := sc.QueueSubscribe("foo", "bar", func(m *stan.Msg) {
+		if m.Redelivered {
+			m.Ack()
+			return
+		}
+		// Wait for more than AckWait, then ack
+		time.Sleep(150 * time.Millisecond)
+		m.Ack()
+		ch <- true
+	}, stan.SetManualAckMode(), stan.AckWait(ackWaitInMs(100)), stan.MaxInflight(3)); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	// Create second queue member that does not ack.
+	if _, err := sc.QueueSubscribe("foo", "bar", func(m *stan.Msg) {},
+		stan.SetManualAckMode(), stan.AckWait(ackWaitInMs(500)), stan.MaxInflight(3)); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	for count := 0; count < 5; {
+		if err := sc.Publish("foo", []byte("msg")); err != nil {
+			t.Fatalf("Error on publish: %v", err)
+		}
+		select {
+		case <-ch:
+			count++
+		case <-time.After(time.Second):
+			// Try another message
+		}
+	}
+
+	// Make sure that state is replicated
+	time.Sleep(testLazyReplicationInterval * 2)
+
+	// Ensure that the pending map and stalled are 0 and false
+	// on all servers for all subs.
+	waitFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		for _, s := range servers {
+			subs := s.clients.getSubs(clientName)
+			for _, sub := range subs {
+				var err error
+				sub.RLock()
+				if len(sub.acksPending) != 0 || sub.stalled {
+					err = fmt.Errorf("Invalid values: node=%s - acksPending=%v - stalled=%v",
+						s.opts.Clustering.NodeID, sub.acksPending, sub.stalled)
+				}
+				sub.RUnlock()
+				if err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
+func TestClusteringQueueRedeliverySentAndAck(t *testing.T) {
+	// Set this to something very large so we can manually cause the flush.
+	lazyReplicationInterval = time.Hour
+	defer func() { lazyReplicationInterval = testLazyReplicationInterval }()
+
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	getLeader(t, 10*time.Second, s1, s2)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	qsubCh := make(chan stan.Subscription, 1)
+	ch := make(chan bool, 1)
+	// Create a queue sub with manual ack mode and ackwait of 250ms.
+	if _, err := sc.QueueSubscribe("foo", "queue", func(m *stan.Msg) {
+		if !m.Redelivered {
+			ch <- true
+		} else {
+			select {
+			case qs := <-qsubCh:
+				qs.Close()
+				ch <- true
+			default:
+			}
+		}
+	}, stan.SetManualAckMode(), stan.AckWait(ackWaitInMs(250))); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	subs := s1.clients.getSubs(clientName)
+	qsub1 := subs[0]
+
+	// Send a message
+	if err := sc.Publish("foo", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+	// Wait for message to be received by qsub1
+	if err := Wait(ch); err != nil {
+		t.Fatalf("Did not our message")
+	}
+	// Now start a second queue sub member that should receive the message
+	// once the first qsub AckWait elapses
+	qsub2, err := sc.QueueSubscribe("foo", "queue", func(m *stan.Msg) {
+		if m.Redelivered {
+			ch <- true
+		}
+	}, stan.SetManualAckMode(), stan.AckWait(ackWaitInMs(100)))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	qsubCh <- qsub2
+	// Wait for message to be received by qsub2
+	if err := Wait(ch); err != nil {
+		t.Fatalf("Did not our message")
+	}
+	// Now again wait that is redelivered to qsub1, which should
+	// close qsub2 and from now on, it should be the only one
+	// to get the message redelivered to.
+	if err := Wait(ch); err != nil {
+		t.Fatalf("Did not our message")
+	}
+	// Trigger the flush of sent/ack occurs now.
+	s1.replicateSubSentAndAck(qsub1)
+
+	// Wait for this to be replicated on s2
+	waitFor(t, time.Second, 15*time.Millisecond, func() error {
+		subs := s2.clients.getSubs(clientName)
+		if len(subs) != 1 {
+			return fmt.Errorf("Incorrect number of subs, expected 1, got %v", len(subs))
+		}
+		sub := subs[0]
+		sub.RLock()
+		if sub.ID != qsub1.ID {
+			sub.RUnlock()
+			return fmt.Errorf("Wrong subscription, expected subID %v, got %v", qsub1.ID, sub.ID)
+		}
+		lastSent := sub.LastSent
+		pending := len(sub.acksPending)
+		sub.RUnlock()
+		if lastSent != 1 {
+			return fmt.Errorf("Last sent should be 1, got %v", lastSent)
+		}
+		if pending != 1 {
+			return fmt.Errorf("There should be one message pending, got %v", pending)
+		}
+		return nil
+	})
+}
+
+func TestClusteringQueueNoPendingCountIfNoMsg(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	servers := []*StanServer{s1, s2}
+	getLeader(t, 10*time.Second, servers...)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	// Create two queue subs
+	qsub1, err := sc.QueueSubscribe("foo", "queue", func(m *stan.Msg) {},
+		stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	if _, err := sc.QueueSubscribe("foo", "queue", func(m *stan.Msg) {},
+		stan.DurableName("dur")); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	// Now close the first
+	qsub1.Close()
+
+	// We wait for more than the replication interval
+	time.Sleep(2 * testLazyReplicationInterval)
+
+	// Make sure that the remaining queue sub on both servers does not show
+	// a pending count of 1.
+	waitFor(t, time.Second, 15*time.Millisecond, func() error {
+		for _, srv := range servers {
+			subs := srv.clients.getSubs(clientName)
+			if len(subs) != 1 {
+				return fmt.Errorf("2 queue subs still present")
+			}
+			qsub := subs[0]
+			qsub.RLock()
+			pending := len(qsub.acksPending)
+			qsub.RUnlock()
+			if pending != 0 {
+				return fmt.Errorf("Pending count should be 0, got %v", pending)
+			}
+		}
+		return nil
+	})
+}
+
+type captureSubCloseErrLogger struct {
+	dummyLogger
+	errCh chan string
+}
+
+func (l *captureSubCloseErrLogger) Errorf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if strings.Contains(msg, "sub close request for unknown") {
+		select {
+		case l.errCh <- msg:
+		default:
+		}
+	}
+}
+
+func TestClusteringDoNotReportSubCloseMissingSubjectOnReplay(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	maxInactivity := 250 * time.Millisecond
+
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1sOpts.Clustering.TrailingLogs = 5
+	s1sOpts.MaxInactivity = maxInactivity
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2sOpts.Clustering.TrailingLogs = 5
+	s2sOpts.MaxInactivity = maxInactivity
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	s3sOpts := getTestDefaultOptsForClustering("c", false)
+	s3sOpts.Clustering.TrailingLogs = 5
+	s3sOpts.MaxInactivity = maxInactivity
+	s3 := runServerWithOpts(t, s3sOpts, nil)
+	defer s3.Shutdown()
+
+	servers := []*StanServer{s1, s2, s3}
+	getLeader(t, 10*time.Second, servers...)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	sub, err := sc.Subscribe("foo", func(_ *stan.Msg) {})
+	if err != nil {
+		t.Fatalf("Error on sub: %v", err)
+	}
+	if _, err := sc.Subscribe("bar", func(_ *stan.Msg) {}); err != nil {
+		t.Fatalf("Error on sub: %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		sc.Publish("bar", []byte("msg"))
+	}
+
+	// Do snapshot on all servers
+	for _, s := range servers {
+		if err := s.raft.Snapshot().Error(); err != nil {
+			t.Fatalf("Error on snapshot: %v", err)
+		}
+	}
+	// Close sub on "foo", and wait for more than channel expiration
+	sub.Close()
+	time.Sleep(2 * maxInactivity)
+	s3.Shutdown()
+
+	// Set a logger that'll collect errors
+	l := &captureSubCloseErrLogger{errCh: make(chan string, 1)}
+	s3sOpts.CustomLogger = l
+	s3 = runServerWithOpts(t, s3sOpts, nil)
+	defer s3.Shutdown()
+
+	// Create a sub on a new channel. We will use that as a "marker"
+	if _, err := sc.Subscribe("baz", func(_ *stan.Msg) {}); err != nil {
+		// to know that s3 has processed the sub1.Close() request.
+		t.Fatalf("Error on sub: %v", err)
+	}
+	checkChannelsInAllServers(t, []string{"bar", "baz"}, 10*time.Second, s3)
+
+	select {
+	case e := <-l.errCh:
+		t.Fatalf("Got error: %s", e)
+	default:
+		// OK
 	}
 }
